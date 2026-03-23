@@ -1,0 +1,78 @@
+name: Deploy BBCC API to Production
+
+on:
+  push:
+    branches:
+      - production
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: production
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run tests
+        run: npm test
+
+      - name: Build application
+        run: npm run build
+
+      - name: Deploy to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+        run: |
+          # Setup SSH
+          mkdir -p ~/.ssh
+          echo "$EC2_SSH_KEY" > ~/.ssh/deploy_key.pem
+          chmod 600 ~/.ssh/deploy_key.pem
+          ssh-keyscan -H $EC2_HOST >> ~/.ssh/known_hosts
+
+          # Deploy via SSH
+          ssh -i ~/.ssh/deploy_key.pem $EC2_USERNAME@$EC2_HOST << 'ENDSSH'
+            # Navigate to project directory
+            cd /var/www/bbcc/api
+
+            # Pull latest from production
+            git fetch origin production
+            git reset --hard origin/production
+
+            # Load environment variables from Parameter Store
+            export DATABASE_URL=$(aws ssm get-parameter --name "/bbcc/api/prod/DATABASE_URL" --with-decryption --query "Parameter.Value" --output text --region ap-south-1)
+            export JWT_ACCESS_SECRET=$(aws ssm get-parameter --name "/bbcc/api/prod/JWT_ACCESS_SECRET" --with-decryption --query "Parameter.Value" --output text --region ap-south-1)
+            export JWT_REFRESH_SECRET=$(aws ssm get-parameter --name "/bbcc/api/prod/JWT_REFRESH_SECRET" --with-decryption --query "Parameter.Value" --output text --region ap-south-1)
+            export FRONTEND_URL=$(aws ssm get-parameter --name "/bbcc/api/prod/FRONTEND_URL" --query "Parameter.Value" --output text --region ap-south-1)
+
+            # Write .env file
+            cat > .env << EOF
+          NODE_ENV=production
+          PORT=5003
+          LOG_LEVEL=info
+          SERVICE_NAME=bbcc-api
+          DATABASE_URL=$DATABASE_URL
+          FRONTEND_URL=$FRONTEND_URL
+          JWT_ACCESS_SECRET=$JWT_ACCESS_SECRET
+          JWT_REFRESH_SECRET=$JWT_REFRESH_SECRET
+          EOF
+
+            # Install dependencies and build
+            npm ci --production
+            npm run build
+
+            # Restart PM2
+            pm2 restart bbcc-api || pm2 start ecosystem.config.js --only bbcc-api
+            pm2 save
+          ENDSSH
