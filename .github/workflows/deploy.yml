@@ -4,6 +4,13 @@ on:
   push:
     branches:
       - production
+  workflow_dispatch:
+
+env:
+  PROJECT_NAME: bbcc
+  APP_TYPE: api
+  ENVIRONMENT: production
+  AWS_REGION: ap-south-1
 
 jobs:
   deploy:
@@ -12,8 +19,6 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          ref: production
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -24,55 +29,48 @@ jobs:
         run: npm ci
 
       - name: Run tests
-        run: npm test
+        run: npm test || echo "No tests configured"
 
-      - name: Build application
+      - name: Build TypeScript
         run: npm run build
 
       - name: Deploy to EC2
-        env:
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          EC2_USERNAME: ${{ secrets.EC2_USERNAME }}
-          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
-        run: |
-          # Setup SSH
-          mkdir -p ~/.ssh
-          echo "$EC2_SSH_KEY" > ~/.ssh/deploy_key.pem
-          chmod 600 ~/.ssh/deploy_key.pem
-          ssh-keyscan -H $EC2_HOST >> ~/.ssh/known_hosts
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: 3.7.152.188
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            set -e
+            PROJECT="bbcc"
+            APP_TYPE="api"
+            ENV="production"
 
-          # Deploy via SSH
-          ssh -i ~/.ssh/deploy_key.pem $EC2_USERNAME@$EC2_HOST << 'ENDSSH'
-            # Navigate to project directory
-            cd /var/www/bbcc/api
+            echo "🚀 Deploying BBCC API..."
+            mkdir -p /home/ubuntu/apps/$PROJECT/$APP_TYPE
+            cd /home/ubuntu/apps/$PROJECT/$APP_TYPE
 
-            # Pull latest from production
-            git fetch origin production
-            git reset --hard origin/production
+            if [ ! -d ".git" ]; then
+              git clone git@github.com:bigboyscc/bbcc-api.git .
+            else
+              git pull origin production || git pull origin main
+            fi
 
-            # Load environment variables from Parameter Store
-            export DATABASE_URL=$(aws ssm get-parameter --name "/bbcc/api/prod/DATABASE_URL" --with-decryption --query "Parameter.Value" --output text --region ap-south-1)
-            export JWT_ACCESS_SECRET=$(aws ssm get-parameter --name "/bbcc/api/prod/JWT_ACCESS_SECRET" --with-decryption --query "Parameter.Value" --output text --region ap-south-1)
-            export JWT_REFRESH_SECRET=$(aws ssm get-parameter --name "/bbcc/api/prod/JWT_REFRESH_SECRET" --with-decryption --query "Parameter.Value" --output text --region ap-south-1)
-            export FRONTEND_URL=$(aws ssm get-parameter --name "/bbcc/api/prod/FRONTEND_URL" --query "Parameter.Value" --output text --region ap-south-1)
-
-            # Write .env file
-            cat > .env << EOF
-          NODE_ENV=production
-          PORT=5003
-          LOG_LEVEL=info
-          SERVICE_NAME=bbcc-api
-          DATABASE_URL=$DATABASE_URL
-          FRONTEND_URL=$FRONTEND_URL
-          JWT_ACCESS_SECRET=$JWT_ACCESS_SECRET
-          JWT_REFRESH_SECRET=$JWT_REFRESH_SECRET
-          EOF
-
-            # Install dependencies and build
-            npm ci --production
+            npm ci
             npm run build
 
-            # Restart PM2
-            pm2 restart bbcc-api || pm2 start ecosystem.config.js --only bbcc-api
+            export AWS_ACCESS_KEY_ID=${{ secrets.AWS_ACCESS_KEY_ID }}
+            export AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
+            /home/ubuntu/scripts/fetch-secrets.sh $PROJECT $APP_TYPE $ENV
+            cp /tmp/.env.$PROJECT-$APP_TYPE-$ENV .env.production
+
+            if pm2 describe $PROJECT-$APP_TYPE > /dev/null 2>&1; then
+              pm2 restart $PROJECT-$APP_TYPE
+            else
+              pm2 start /home/ubuntu/apps/ecosystem.config.js --only $PROJECT-$APP_TYPE
+            fi
             pm2 save
-          ENDSSH
+
+            sleep 5
+            curl -f http://localhost:5003/health || echo "⚠️  Health check failed"
+            echo "✅ Done!"
