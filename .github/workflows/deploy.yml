@@ -53,7 +53,8 @@ jobs:
             if [ ! -d ".git" ]; then
               git clone git@github.com:bigboyscc/bbcc-api.git .
             else
-              git pull origin production || git pull origin main
+              git fetch origin
+              git reset --hard origin/production || git reset --hard origin/main
             fi
 
             npm ci
